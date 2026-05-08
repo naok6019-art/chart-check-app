@@ -1,15 +1,8 @@
 from datetime import date
-import hashlib
 from io import BytesIO
-import re
 
 import pandas as pd
 import streamlit as st
-
-try:
-    import authlib  # noqa: F401
-except ImportError:
-    authlib = None
 
 try:
     import gspread
@@ -18,9 +11,9 @@ except ImportError:
     gspread = None
     Credentials = None
 
-APP_VERSION = "2026-05-09-user-login-sheets-v2"
+APP_VERSION = "2026-05-09-stable-one-sheet"
 DATA_FILE = "karte_checklist.csv"
-WORKSHEET_PREFIX = "karte_"
+WORKSHEET_NAME = "karte_checklist"
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
@@ -45,42 +38,6 @@ def has_secret(key: str) -> bool:
 
 def has_google_settings() -> bool:
     return has_secret("spreadsheet_id") and has_secret("gcp_service_account")
-
-
-def has_auth_settings() -> bool:
-    try:
-        auth = st.secrets.get("auth", {})
-        required = [
-            "redirect_uri",
-            "cookie_secret",
-            "client_id",
-            "client_secret",
-            "server_metadata_url",
-        ]
-        return all(key in auth and str(auth[key]).strip() for key in required)
-    except Exception:
-        return False
-
-
-def is_logged_in() -> bool:
-    try:
-        return bool(st.user.is_logged_in)
-    except Exception:
-        return False
-
-
-def current_email() -> str:
-    try:
-        return str(st.user.email).strip().lower()
-    except Exception:
-        return ""
-
-
-def worksheet_name_for_email(email: str) -> str:
-    normalized = email.strip().lower()
-    safe = re.sub(r"[^a-z0-9]+", "_", normalized).strip("_") or "user"
-    digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:8]
-    return f"{WORKSHEET_PREFIX}{safe}_{digest}"[:100]
 
 
 def normalize_text(value) -> str:
@@ -109,7 +66,7 @@ def normalize_data(data: pd.DataFrame) -> pd.DataFrame:
 
 
 @st.cache_resource
-def get_worksheet(worksheet_name: str):
+def get_worksheet():
     if gspread is None or Credentials is None:
         raise RuntimeError("Googleスプレッドシート用ライブラリがありません。requirements.txtを確認してください。")
     credentials = Credentials.from_service_account_info(
@@ -119,16 +76,16 @@ def get_worksheet(worksheet_name: str):
     client = gspread.authorize(credentials)
     spreadsheet = client.open_by_key(st.secrets["spreadsheet_id"])
     try:
-        worksheet = spreadsheet.worksheet(worksheet_name)
+        worksheet = spreadsheet.worksheet(WORKSHEET_NAME)
     except gspread.WorksheetNotFound:
-        worksheet = spreadsheet.add_worksheet(title=worksheet_name, rows=1000, cols=len(COLUMNS))
+        worksheet = spreadsheet.add_worksheet(title=WORKSHEET_NAME, rows=1000, cols=len(COLUMNS))
         worksheet.update([COLUMNS])
     return worksheet
 
 
 def load_data() -> pd.DataFrame:
     if has_google_settings():
-        worksheet = get_worksheet(worksheet_name_for_email(current_email()))
+        worksheet = get_worksheet()
         return normalize_data(pd.DataFrame(worksheet.get_all_records()))
     try:
         return normalize_data(pd.read_csv(DATA_FILE, encoding="utf-8-sig"))
@@ -138,7 +95,7 @@ def load_data() -> pd.DataFrame:
 
 def save_data(data: pd.DataFrame) -> None:
     if has_google_settings():
-        worksheet = get_worksheet(worksheet_name_for_email(current_email()))
+        worksheet = get_worksheet()
         sheet_data = data[COLUMNS].copy()
         for item in CHECK_ITEMS:
             sheet_data[item] = sheet_data[item].map(lambda value: "TRUE" if bool(value) else "FALSE")
@@ -198,37 +155,16 @@ def create_monthly_records(data: pd.DataFrame, target_month: str, users: pd.Data
     return data, len(records), skipped
 
 
-def require_login() -> None:
-    if not has_google_settings():
-        return
-    if authlib is None:
-        st.error("Googleログインに必要なAuthlibがありません。Streamlit Cloudで再デプロイしてください。")
-        st.stop()
-    if not has_auth_settings():
-        st.error("Googleログイン設定が不足しています。Streamlit CloudのSecretsに[auth]設定を追加してください。")
-        st.stop()
-    if not is_logged_in():
-        st.info("このアプリを使うにはGoogleログインが必要です。")
-        if st.button("Googleでログイン"):
-            st.login()
-        st.stop()
-
-
 st.set_page_config(page_title="月次カルテ確認チェックリスト", layout="wide")
 st.title("訪問看護ステーション 月次カルテ確認チェックリスト")
-st.caption("ローカルではCSV、WebアプリではGoogleスプレッドシートに保存できます。")
+st.caption("WebアプリではGoogleスプレッドシート、ローカルではCSVに保存します。")
 st.caption(f"アプリ版: {APP_VERSION}")
-
-require_login()
 
 data = load_data()
 
 if has_google_settings():
     st.success("保存先: Googleスプレッドシート")
-    st.caption(f"ログイン中: {current_email()}")
-    st.caption(f"保存シート: {worksheet_name_for_email(current_email())}")
-    if st.button("ログアウト"):
-        st.logout()
+    st.caption(f"保存シート: {WORKSHEET_NAME}")
 else:
     st.info("保存先: ローカルCSV")
 
