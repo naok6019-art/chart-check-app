@@ -1,6 +1,8 @@
 from datetime import date
+import hashlib
 from io import BytesIO
 from pathlib import Path
+import re
 
 import pandas as pd
 import streamlit as st
@@ -22,9 +24,9 @@ except ImportError:
 # アプリを閉じたり、PCを再起動したりしても、このCSVが残っていればデータも残ります。
 DATA_FILE = Path("karte_checklist.csv")
 
-# Googleスプレッドシートに保存する場合のシート名です。
-# Webアプリ化したときは、このシートがデータベース代わりになります。
-GOOGLE_SHEET_WORKSHEET_NAME = "karte_checklist"
+# Googleスプレッドシートに保存する場合のシート名の先頭に付ける文字です。
+# 実際には、ログインしたメールアドレスごとに別シートを作ります。
+GOOGLE_SHEET_WORKSHEET_PREFIX = "karte_"
 
 # Googleスプレッドシートにアクセスするための権限範囲です。
 # 読み書きするために spreadsheets、共有設定を確認するために drive を使います。
@@ -52,6 +54,9 @@ CHECK_ITEMS = [
 # ここにある列だけを保存することで、画面表示用の列がCSVに混ざらないようにします。
 COLUMNS = ["対象月", "利用者名"] + CHECK_ITEMS
 
+# Web公開後に、Streamlit Cloudへ最新コードが反映されているか確認するための表示です。
+APP_VERSION = "2026-05-08-user-login-sheets"
+
 
 # ==============================
 # データ処理
@@ -59,10 +64,58 @@ COLUMNS = ["対象月", "利用者名"] + CHECK_ITEMS
 
 def has_google_sheets_settings() -> bool:
     """Googleスプレッドシート保存に必要な設定があるか確認します。"""
-    return (
-        "spreadsheet_id" in st.secrets
-        and "gcp_service_account" in st.secrets
-    )
+    try:
+        return (
+            "spreadsheet_id" in st.secrets
+            and "gcp_service_account" in st.secrets
+        )
+    except Exception:
+        # ローカル利用では secrets.toml を作らないことが多いです。
+        # その場合はGoogleスプレッドシート保存を使わず、CSV保存に切り替えます。
+        return False
+
+
+def has_auth_settings() -> bool:
+    """Googleログインに必要なStreamlit認証設定があるか確認します。"""
+    try:
+        auth_settings = st.secrets.get("auth", {})
+        return all(
+            key in auth_settings
+            for key in ["redirect_uri", "cookie_secret", "client_id", "client_secret", "server_metadata_url"]
+        )
+    except Exception:
+        return False
+
+
+def is_user_logged_in() -> bool:
+    """現在の利用者がログイン済みか確認します。"""
+    try:
+        return bool(st.user.is_logged_in)
+    except Exception:
+        return False
+
+
+def get_current_user_email() -> str:
+    """ログイン中ユーザーのメールアドレスを取得します。"""
+    try:
+        return str(st.user.email).strip().lower()
+    except Exception:
+        return ""
+
+
+def create_user_worksheet_name(email: str) -> str:
+    """メールアドレスから、Googleスプレッドシートのシート名を作ります。"""
+    normalized_email = email.strip().lower()
+
+    # Googleスプレッドシートのシート名に使いにくい文字を _ に置き換えます。
+    safe_email = re.sub(r"[^a-z0-9]+", "_", normalized_email)
+    safe_email = safe_email.strip("_") or "user"
+
+    # シート名が長くなりすぎないように、末尾に短い識別子を付けます。
+    digest = hashlib.sha1(normalized_email.encode("utf-8")).hexdigest()[:8]
+    worksheet_name = f"{GOOGLE_SHEET_WORKSHEET_PREFIX}{safe_email}_{digest}"
+
+    return worksheet_name[:100]
 
 
 def get_storage_label() -> str:
@@ -72,8 +125,56 @@ def get_storage_label() -> str:
     return "ローカルCSV"
 
 
+def show_storage_status() -> None:
+    """保存先の状態と、設定方法の案内を表示します。"""
+    if has_google_sheets_settings():
+        st.success("保存先: Googleスプレッドシート")
+        user_email = get_current_user_email()
+        if user_email:
+            st.caption(f"ログイン中: {user_email}")
+            st.caption(f"保存シート: {create_user_worksheet_name(user_email)}")
+        return
+
+    st.info("保存先: ローカルCSV")
+
+    with st.expander("保存先について"):
+        st.write(
+            "この表示のままで問題ありません。"
+            "今の状態では、入力データはこのアプリのフォルダ内にある "
+            "`karte_checklist.csv` に保存されます。"
+        )
+        st.write(
+            "ブラウザ画面からGoogleスプレッドシート保存へ切り替えることはできません。"
+            "Webアプリ化するときだけ、Streamlit Community CloudのSecretsに"
+            "Googleスプレッドシート設定を登録します。"
+        )
+        st.write(
+            "まずローカルPCで使う場合は、このまま使って大丈夫です。"
+        )
+
+
+def require_login_for_google_sheets() -> None:
+    """Googleスプレッドシート保存時はGoogleログインを必須にします。"""
+    if not has_google_sheets_settings():
+        return
+
+    if not has_auth_settings():
+        st.error("Googleログイン設定がまだ入っていません。")
+        st.write(
+            "ユーザーごとに別データで使うには、Streamlit CloudのSecretsに "
+            "`[auth]` 設定を追加してください。"
+        )
+        st.stop()
+
+    if not is_user_logged_in():
+        st.info("このアプリを使うにはGoogleログインが必要です。")
+        if st.button("Googleでログイン"):
+            st.login()
+        st.stop()
+
+
 @st.cache_resource
-def get_google_worksheet():
+def get_google_worksheet(worksheet_name: str):
     """Googleスプレッドシートのワークシートを取得します。"""
     if gspread is None or Credentials is None:
         raise RuntimeError(
@@ -89,10 +190,10 @@ def get_google_worksheet():
     spreadsheet = client.open_by_key(st.secrets["spreadsheet_id"])
 
     try:
-        worksheet = spreadsheet.worksheet(GOOGLE_SHEET_WORKSHEET_NAME)
+        worksheet = spreadsheet.worksheet(worksheet_name)
     except gspread.WorksheetNotFound:
         worksheet = spreadsheet.add_worksheet(
-            title=GOOGLE_SHEET_WORKSHEET_NAME,
+            title=worksheet_name,
             rows=1000,
             cols=len(COLUMNS),
         )
@@ -121,7 +222,7 @@ def normalize_bool(value) -> bool:
 def load_data() -> pd.DataFrame:
     """保存済みデータを読み込みます。なければ空の表を作ります。"""
     if has_google_sheets_settings():
-        worksheet = get_google_worksheet()
+        worksheet = get_google_worksheet(create_user_worksheet_name(get_current_user_email()))
         records = worksheet.get_all_records()
         data = pd.DataFrame(records)
         return normalize_data(data)
@@ -175,7 +276,7 @@ def save_csv_data(data: pd.DataFrame) -> None:
 
 def save_google_sheets_data(data: pd.DataFrame) -> None:
     """現在のチェック結果をGoogleスプレッドシートに保存します。"""
-    worksheet = get_google_worksheet()
+    worksheet = get_google_worksheet(create_user_worksheet_name(get_current_user_email()))
     save_data_for_sheet = data[COLUMNS].copy()
 
     # Googleスプレッドシートには True / False を文字として保存します。
@@ -313,6 +414,11 @@ st.set_page_config(
 
 st.title("訪問看護ステーション 月次カルテ確認チェックリスト")
 st.caption("ローカルではCSV、WebアプリではGoogleスプレッドシートに保存できます。")
+st.caption(f"アプリ版: {APP_VERSION}")
+
+# Googleスプレッドシート保存を使うWeb版では、利用者ごとのデータを分けるために
+# Googleログインを必須にします。
+require_login_for_google_sheets()
 
 # 保存済みデータを読み込みます。
 # Googleスプレッドシート設定がない場合は、自動的にローカルCSVを使います。
@@ -323,7 +429,11 @@ except Exception as error:
     st.exception(error)
     st.stop()
 
-st.info(f"現在の保存先: {get_storage_label()}")
+show_storage_status()
+
+if has_google_sheets_settings() and is_user_logged_in():
+    if st.button("ログアウト"):
+        st.logout()
 
 # 今日の日付から、対象月の初期値を作ります。
 default_month = date.today().strftime("%Y-%m")
