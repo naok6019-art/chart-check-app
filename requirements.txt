@@ -1,5 +1,4 @@
-streamlit[auth]
+streamlit
 pandas
 gspread
 google-auth
-Authlib==1.6.8
